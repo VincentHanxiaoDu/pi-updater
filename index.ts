@@ -296,7 +296,9 @@ export default function (pi: ExtensionAPI) {
   // Host capability cannot change within a process; probe ctx.ui.custom once.
   let customSupport: Promise<boolean> | undefined;
 
-  function hostCanInstall(ctx: ExtensionContext): Promise<boolean> {
+  // Whether the host can render the TUI progress loader - not whether it can
+  // install. Installing works everywhere; only the way progress is shown differs.
+  function hostCanRenderLoader(ctx: ExtensionContext): Promise<boolean> {
     customSupport ??= hostCanRunCustom(ctx);
     return customSupport;
   }
@@ -360,7 +362,45 @@ export default function (pi: ExtensionAPI) {
 
   async function doInstall(ctx: ExtensionContext, target: UpdateTarget, piLatest?: string) {
     const command = UPDATE_COMMANDS[target];
-    const success = await ctx.ui.custom<boolean>((tui, theme, _kb, done) => {
+    const success = (await hostCanRenderLoader(ctx))
+      ? await installBehindLoader(ctx, target, command)
+      : await installWithNotices(ctx, target, command);
+
+    if (!success) return;
+    return finishInstall(ctx, target, piLatest);
+  }
+
+  // Hosts without a TUI (pi-web and any other RPC host) cannot draw the loader.
+  // The install itself needs no terminal, so run it and report through notices;
+  // silence here is what made "Update now" look like a dead button.
+  async function installWithNotices(
+    ctx: ExtensionContext,
+    target: UpdateTarget,
+    command: (typeof UPDATE_COMMANDS)[UpdateTarget],
+  ): Promise<boolean> {
+    ctx.ui.notify(`Running ${command.display}...`, "info");
+    try {
+      const failure = await runNativeUpdate(pi, target);
+      if (failure) {
+        ctx.ui.notify(formatInstallFailure(failure, command.display), "error");
+        return false;
+      }
+      return true;
+    } catch (error) {
+      ctx.ui.notify(
+        `Update failed: ${error instanceof Error ? error.message : String(error)}`,
+        "error",
+      );
+      return false;
+    }
+  }
+
+  async function installBehindLoader(
+    ctx: ExtensionContext,
+    target: UpdateTarget,
+    command: (typeof UPDATE_COMMANDS)[UpdateTarget],
+  ): Promise<boolean> {
+    const done_ = await ctx.ui.custom<boolean>((tui, theme, _kb, done) => {
       const loader = new BorderedLoader(tui, theme, `Running ${command.display}...`);
       loader.onAbort = () => done(false);
 
@@ -383,9 +423,10 @@ export default function (pi: ExtensionAPI) {
 
       return loader;
     });
+    return done_ === true;
+  }
 
-    if (!success) return;
-
+  async function finishInstall(ctx: ExtensionContext, target: UpdateTarget, piLatest?: string) {
     if (target === "extensions") {
       await reloadExtensions(ctx);
       return;
@@ -421,37 +462,6 @@ export default function (pi: ExtensionAPI) {
   async function showUpdatePrompt(ctx: ExtensionContext, offer: UpdateOffer) {
     const { piLatest, extensions } = offer;
     const extList = extensions.join(", ");
-
-    if (!(await hostCanInstall(ctx))) {
-      // RPC-style hosts (e.g. pi-web) stub ctx.ui.custom() out, so every
-      // "Update ..." option below would silently do nothing in doInstall().
-      // Say so and point at the terminal instead of promising an update this
-      // host cannot perform.
-      let advice: string;
-      if (piLatest && extensions.length > 0) {
-        advice = `run \`pi update --self --extensions\` in a terminal to update pi ${VERSION} → ${piLatest} and extensions: ${extList}`;
-      } else if (piLatest) {
-        advice = `run \`pi update --self\` in a terminal to update pi ${VERSION} → ${piLatest}`;
-      } else {
-        advice = `run \`pi update --extensions\` in a terminal to update extensions: ${extList}`;
-      }
-      ctx.ui.notify(`This host cannot run the updater — ${advice}.`, "warning");
-
-      if (piLatest) {
-        // In a host that cannot install, re-prompting every session_start
-        // would only repeat advice the user has already seen, so any explicit
-        // answer (Skip included) ends the loop for this version. The combined
-        // prompt normally defers dismissal to the pi-only prompt, but here
-        // the degraded menu is the only prompt the user will see.
-        const ignorePiVersion = `Ignore ${piLatest}`;
-        const choice = await ctx.ui.select(`Update ${VERSION} → ${piLatest}`, [
-          "Skip",
-          ignorePiVersion,
-        ]);
-        if (choice) dismissVersion(piLatest);
-      }
-      return;
-    }
 
     if (piLatest && extensions.length > 0) {
       const updateAll = "Update all";
