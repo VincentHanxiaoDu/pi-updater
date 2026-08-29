@@ -217,6 +217,41 @@ function formatInstallFailure(failure: InstallFailure, display: string): string 
   return `Update failed while running \`${display}\` (exit ${failure.code})${failure.output ? `: ${failure.output}` : ""}`;
 }
 
+/**
+ * Sentinel resolved by the ctx.ui.custom capability probe below. A host that
+ * actually executes custom components (terminal TUI) resolves the custom()
+ * promise with this exact in-process value; hosts that stub custom() out
+ * (RPC/headless — e.g. pi-web's session host) resolve undefined without ever
+ * running the factory.
+ */
+const CUSTOM_PROBE_SENTINEL = Symbol("pi-updater.customProbe");
+
+/**
+ * Probe whether this host actually executes ctx.ui.custom() factories.
+ *
+ * ctx.hasUI cannot discriminate: RPC hosts like pi-web bind a real UI context
+ * (select/confirm/input/notify work) but stub custom() to a no-op that
+ * resolves undefined without running the factory. That resolution contract is
+ * exactly what doInstall() depends on, so probing it classifies hosts where
+ * "Update now" would be a silent no-op without changing terminal behavior.
+ */
+async function hostCanRunCustom(ctx: ExtensionContext): Promise<boolean> {
+  try {
+    const result = await ctx.ui.custom<symbol | undefined>(
+      (_tui, _theme, _keybindings, done) => {
+        // Resolving inside the factory keeps the probe invisible: the TUI
+        // host treats done-before-return as "already closed" and never
+        // mounts the (empty) component.
+        done(CUSTOM_PROBE_SENTINEL);
+        return { render: () => [], invalidate: () => {} };
+      },
+    );
+    return result === CUSTOM_PROBE_SENTINEL;
+  } catch {
+    return false;
+  }
+}
+
 async function runNativeUpdate(
   pi: ExtensionAPI,
   target: UpdateTarget,
@@ -258,6 +293,13 @@ export default function (pi: ExtensionAPI) {
   let promptOpen = false;
   const promptedVersions = new Set<string>();
   let liveCheckStarted = false;
+  // Host capability cannot change within a process; probe ctx.ui.custom once.
+  let customSupport: Promise<boolean> | undefined;
+
+  function hostCanInstall(ctx: ExtensionContext): Promise<boolean> {
+    customSupport ??= hostCanRunCustom(ctx);
+    return customSupport;
+  }
 
   // Consume the one-shot suppression from a post-update restart. Deleting it
   // keeps it from propagating into any further restarts from this session.
@@ -379,6 +421,37 @@ export default function (pi: ExtensionAPI) {
   async function showUpdatePrompt(ctx: ExtensionContext, offer: UpdateOffer) {
     const { piLatest, extensions } = offer;
     const extList = extensions.join(", ");
+
+    if (!(await hostCanInstall(ctx))) {
+      // RPC-style hosts (e.g. pi-web) stub ctx.ui.custom() out, so every
+      // "Update ..." option below would silently do nothing in doInstall().
+      // Say so and point at the terminal instead of promising an update this
+      // host cannot perform.
+      let advice: string;
+      if (piLatest && extensions.length > 0) {
+        advice = `run \`pi update --self --extensions\` in a terminal to update pi ${VERSION} → ${piLatest} and extensions: ${extList}`;
+      } else if (piLatest) {
+        advice = `run \`pi update --self\` in a terminal to update pi ${VERSION} → ${piLatest}`;
+      } else {
+        advice = `run \`pi update --extensions\` in a terminal to update extensions: ${extList}`;
+      }
+      ctx.ui.notify(`This host cannot run the updater — ${advice}.`, "warning");
+
+      if (piLatest) {
+        // In a host that cannot install, re-prompting every session_start
+        // would only repeat advice the user has already seen, so any explicit
+        // answer (Skip included) ends the loop for this version. The combined
+        // prompt normally defers dismissal to the pi-only prompt, but here
+        // the degraded menu is the only prompt the user will see.
+        const ignorePiVersion = `Ignore ${piLatest}`;
+        const choice = await ctx.ui.select(`Update ${VERSION} → ${piLatest}`, [
+          "Skip",
+          ignorePiVersion,
+        ]);
+        if (choice) dismissVersion(piLatest);
+      }
+      return;
+    }
 
     if (piLatest && extensions.length > 0) {
       const updateAll = "Update all";
