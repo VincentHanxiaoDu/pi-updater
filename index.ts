@@ -34,6 +34,8 @@ const ENV_SUPPRESS_STARTUP_CHECK = "PI_UPDATER_SUPPRESS_STARTUP_CHECK";
 interface VersionCache {
   latestVersion: string;
   dismissedVersion?: string;
+  /** A version the user already acted on (chose an update for); never re-prompted until a newer one appears. */
+  actedVersion?: string;
   checkedAt?: string;
 }
 
@@ -156,12 +158,13 @@ async function checkForExtensionUpdates(cwd: string): Promise<string[]> {
   }
 }
 
-/** Returns a cached upgrade version if available and not dismissed. */
+/** Returns a cached upgrade version if available and not dismissed or already acted on. */
 function getCachedUpgradeVersion(): string | undefined {
   const cache = readCache();
   if (!cache) return undefined;
   if (!isNewer(cache.latestVersion, VERSION)) return undefined;
   if (cache.dismissedVersion === cache.latestVersion) return undefined;
+  if (cache.actedVersion === cache.latestVersion) return undefined;
   return cache.latestVersion;
 }
 
@@ -187,8 +190,40 @@ function dismissVersion(version: string) {
   writeCache({
     latestVersion: cache?.latestVersion ?? version,
     dismissedVersion: version,
+    actedVersion: cache?.actedVersion,
     checkedAt: cache?.checkedAt,
   });
+}
+
+/** The user chose an update for this version: never re-prompt it (a newer version still prompts). */
+function actOnVersion(version: string) {
+  const cache = readCache();
+  writeCache({
+    latestVersion: cache?.latestVersion ?? version,
+    dismissedVersion: cache?.dismissedVersion,
+    actedVersion: version,
+    checkedAt: cache?.checkedAt,
+  });
+}
+
+/**
+ * The recurrence decision, pure and exported for tests: prompt for `latest`
+ * only when it is newer than the running version, not already prompted in
+ * this process, not dismissed, and not already acted on (the owner-reported
+ * defect: an installed update kept re-prompting because acting recorded
+ * nothing and the running version only changes after a restart).
+ */
+export function shouldPromptForVersion(input: {
+  latest: string;
+  runningVersion: string;
+  cache: VersionCache | undefined;
+  prompted: ReadonlySet<string>;
+}): boolean {
+  if (!isNewer(input.latest, input.runningVersion)) return false;
+  if (input.prompted.has(input.latest)) return false;
+  if (input.cache?.dismissedVersion === input.latest) return false;
+  if (input.cache?.actedVersion === input.latest) return false;
+  return true;
 }
 
 function isBunFsPath(path: string): boolean {
@@ -438,6 +473,17 @@ export default function (pi: ExtensionAPI) {
       : "Tip: run `pi --no-session` to continue without a saved session.";
 
     if (!canAutoRestart(ctx)) {
+      // A long-lived host (pi-web's session daemon) keeps running the old
+      // version until IT is restarted — the owner reported the prompt as
+      // "点 了也没用" because the notice said "restart pi" while the running
+      // daemon never changed. Name the actual restart the host needs.
+      if (!hostCanRenderLoader(ctx)) {
+        ctx.ui.notify(
+          `Updated to ${latest}! The running session daemon still has the old version — restart the session daemon to run it (restart the web/API process first). Until then this prompt stays suppressed for ${latest}.`,
+          "info",
+        );
+        return;
+      }
       ctx.ui.notify(
         `Updated to ${latest}! Please restart pi.\n${restartTip}`,
         "info",
@@ -474,7 +520,18 @@ export default function (pi: ExtensionAPI) {
         [updateAll, updatePi, updateExtensions, "Skip"],
       );
 
-      if (!choice || choice === "Skip") return;
+      if (!choice || choice === "Skip") {
+        // Skip on the combined prompt dismisses the pi version too: the owner
+        // reported the prompt returning for an already-acted version, and a
+        // dismissal that only sometimes dismisses is how that read from the
+        // user's seat.
+        if (choice === "Skip") dismissVersion(piLatest);
+        return;
+      }
+      // Acting on the offer records the version: the install lands on disk
+      // but a long-lived host keeps running the old version until restart,
+      // and an unrecorded action is what made the prompt return.
+      actOnVersion(piLatest);
       if (choice === updateAll) return doInstall(ctx, "all", piLatest);
       if (choice === updatePi) return doInstall(ctx, "self", piLatest);
       if (choice === updateExtensions) return doInstall(ctx, "extensions");
@@ -511,10 +568,7 @@ export default function (pi: ExtensionAPI) {
   }
 
   function canAutoPromptVersion(latest: string): boolean {
-    if (!isNewer(latest, VERSION)) return false;
-    if (promptedVersions.has(latest)) return false;
-    if (readCache()?.dismissedVersion === latest) return false;
-    return true;
+    return shouldPromptForVersion({ latest, runningVersion: VERSION, cache: readCache(), prompted: promptedVersions });
   }
 
   async function maybeShowAutoPrompt(
