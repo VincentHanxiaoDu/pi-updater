@@ -522,7 +522,19 @@ export default function (pi: ExtensionAPI) {
     latest: string | undefined,
     extensions: string[],
   ) {
-    if (!ctx.hasUI) return;
+    // The checks that lead here run after session_start returns, so this ctx
+    // may be stale by the time they resolve - the session it belonged to was
+    // replaced or reloaded. Every ctx member, including the hasUI getter,
+    // throws on a stale ctx, and an unhandled throw here has killed a host
+    // daemon serving other sessions. A stale ctx means the session this
+    // prompt was meant for is gone; the right response is silence.
+    let hasUi: boolean;
+    try {
+      hasUi = ctx.hasUI;
+    } catch {
+      return;
+    }
+    if (!hasUi) return;
     if (promptOpen) return;
 
     const piLatest = latest && canAutoPromptVersion(latest) ? latest : undefined;
@@ -551,7 +563,10 @@ export default function (pi: ExtensionAPI) {
     ])
       .then(([latest, extensions]) => {
         // Fall back to a previously cached pi version if the live fetch failed.
-        void maybeShowAutoPrompt(ctx, latest ?? getCachedUpgradeVersion(), extensions);
+        // Caught explicitly: a rejection from this void launch escapes the
+        // outer catch, and an escaped rejection does not just log - it brings
+        // down the whole process hosting the sessions.
+        maybeShowAutoPrompt(ctx, latest ?? getCachedUpgradeVersion(), extensions).catch(() => {});
       })
       .catch(() => {});
   }
