@@ -1,13 +1,13 @@
 {
   "name": "pi-updater",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "description": "Codex-style auto-updater for pi. Checks pi and extension packages on startup and prompts to install updates.",
   "type": "module",
   "license": "MIT",
   "author": "Toms clanker",
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/tonze/pi-updater.git"
+    "url": "git+https://github.com/VincentHanxiaoDu/pi-updater.git"
   },
   "keywords": [
     "pi-package",
@@ -35,8 +35,8 @@
   },
   "devDependencies": {
     "@earendil-works/pi-coding-agent": "^0.74.1",
-    "@types/node": "^25.9.5",
+    "@types/node": "^25.3.2",
     "typescript": "^5.9.3",
-    "vitest": "^4.1.11"
+    "vitest": "^3.2.4"
   }
 }
