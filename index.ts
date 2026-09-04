@@ -8,7 +8,9 @@ import { readFileSync, writeFileSync, mkdirSync } from "node:fs";
 import { join, dirname } from "node:path";
 
 const LATEST_VERSION_URL = "https://pi.dev/api/latest-version";
-const CACHE_FILE = join(getAgentDir(), "update-cache.json");
+function cacheFile(): string {
+  return join(process.env.PI_UPDATER_CACHE_DIR ?? getAgentDir(), "update-cache.json");
+}
 const UPDATE_COMMANDS = {
   self: { args: ["update", "--self"], display: "pi update --self" },
   extensions: { args: ["update", "--extensions"], display: "pi update --extensions" },
@@ -37,11 +39,42 @@ interface VersionCache {
   /** A version the user already acted on (chose an update for); never re-prompted until a newer one appears. */
   actedVersion?: string;
   checkedAt?: string;
+  /**
+   * Extension update sets the user already answered, keyed by the sorted
+   * update list. The decision is machine-level on purpose: answering in one
+   * session must silence every other session's prompt for the same set -
+   * the owner reported the same extension prompt more than ten times.
+   */
+  settledExtensionSets?: string[];
+}
+
+export function extensionSetKey(extensions: string[]): string {
+  return [...extensions].sort().join("\u0000");
+}
+
+function settleExtensionSet(extensions: string[]) {
+  if (extensions.length === 0) return;
+  const prev = readCache();
+  const settled = new Set(prev?.settledExtensionSets ?? []);
+  settled.add(extensionSetKey(extensions));
+  writeCache({
+    latestVersion: prev?.latestVersion ?? "",
+    dismissedVersion: prev?.dismissedVersion,
+    actedVersion: prev?.actedVersion,
+    checkedAt: prev?.checkedAt,
+    settledExtensionSets: [...settled].slice(-16),
+  });
+}
+
+export function unsettledExtensions(extensions: string[]): string[] {
+  if (extensions.length === 0) return [];
+  const settled = new Set(readCache()?.settledExtensionSets ?? []);
+  return settled.has(extensionSetKey(extensions)) ? [] : extensions;
 }
 
 function readCache(): VersionCache | undefined {
   try {
-    return JSON.parse(readFileSync(CACHE_FILE, "utf-8"));
+    return JSON.parse(readFileSync(cacheFile(), "utf-8"));
   } catch {
     return undefined;
   }
@@ -49,8 +82,8 @@ function readCache(): VersionCache | undefined {
 
 function writeCache(cache: VersionCache) {
   try {
-    mkdirSync(dirname(CACHE_FILE), { recursive: true });
-    writeFileSync(CACHE_FILE, JSON.stringify(cache) + "\n");
+    mkdirSync(dirname(cacheFile()), { recursive: true });
+    writeFileSync(cacheFile(), JSON.stringify(cache) + "\n");
   } catch {}
 }
 
@@ -524,14 +557,19 @@ export default function (pi: ExtensionAPI) {
         // Skip on the combined prompt dismisses the pi version too: the owner
         // reported the prompt returning for an already-acted version, and a
         // dismissal that only sometimes dismisses is how that read from the
-        // user's seat.
-        if (choice === "Skip") dismissVersion(piLatest);
+        // user's seat. The extension set settles as well - a skip answered in
+        // one session answers it for the machine.
+        if (choice === "Skip") {
+          dismissVersion(piLatest);
+          settleExtensionSet(extensions);
+        }
         return;
       }
       // Acting on the offer records the version: the install lands on disk
       // but a long-lived host keeps running the old version until restart,
       // and an unrecorded action is what made the prompt return.
       actOnVersion(piLatest);
+      if (choice === updateAll || choice === updateExtensions) settleExtensionSet(extensions);
       if (choice === updateAll) return doInstall(ctx, "all", piLatest);
       if (choice === updatePi) return doInstall(ctx, "self", piLatest);
       if (choice === updateExtensions) return doInstall(ctx, "extensions");
@@ -563,6 +601,10 @@ export default function (pi: ExtensionAPI) {
         updateAction,
         "Skip",
       ]);
+      // Both answers settle the set machine-wide; an unanswered (dismissed
+      // without an answer) prompt does not, so a genuinely ignored dialog
+      // returns once but an ANSWERED one never nags another session.
+      if (choice === updateAction || choice === "Skip") settleExtensionSet(extensions);
       if (choice === updateAction) await doInstall(ctx, "extensions");
     }
   }
@@ -592,12 +634,13 @@ export default function (pi: ExtensionAPI) {
     if (promptOpen) return;
 
     const piLatest = latest && canAutoPromptVersion(latest) ? latest : undefined;
-    if (!piLatest && extensions.length === 0) return;
+    const openExtensions = unsettledExtensions(extensions);
+    if (!piLatest && openExtensions.length === 0) return;
 
     promptOpen = true;
     if (piLatest) promptedVersions.add(piLatest);
     try {
-      await showUpdatePrompt(ctx, { piLatest, extensions });
+      await showUpdatePrompt(ctx, { piLatest, extensions: openExtensions });
     } finally {
       promptOpen = false;
     }
