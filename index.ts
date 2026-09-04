@@ -585,7 +585,11 @@ export default function (pi: ExtensionAPI) {
         ignorePiVersion,
       ]);
 
-      if (!choice || choice === "Skip") return;
+      if (!choice) return;
+      if (choice === "Skip") {
+        dismissVersion(piLatest);
+        return;
+      }
       if (choice === ignorePiVersion) {
         dismissVersion(piLatest);
         return;
