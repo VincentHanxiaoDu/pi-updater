@@ -1,0 +1,102 @@
+# Tag-driven release: pushing a v* tag verifies, packs, publishes to npm and
+# attaches the same tarball to a GitHub Release. Merging to main releases
+# nothing.
+#
+# The dist-tag follows the version: a prerelease version (0.6.0-preview.0)
+# publishes under `preview`, so `npm i pi-updater` keeps serving the last
+# stable build while testers opt in with `pi-updater@preview`.
+#
+# Credentials: npm trusted publishing (OIDC) is used when the package trusts
+# this workflow path, so keep the filename stable. If an NPM_TOKEN secret is
+# present it is used instead, without provenance.
+name: Release (tag push)
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  release:
+    name: GitHub Release + npm publish
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npx tsc --noEmit
+
+      - name: Test
+        run: npx vitest run
+
+      - name: Refuse a tag that disagrees with package.json
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          ver="$(node -p "require('./package.json').version")"
+          if [ "$tag" != "$ver" ]; then
+            echo "tag $GITHUB_REF_NAME does not match package.json version $ver" >&2
+            exit 1
+          fi
+
+      - name: Pack
+        id: pack
+        run: |
+          set -euo pipefail
+          mkdir -p pack-out
+          tarball="$(npm pack --pack-destination pack-out --silent)"
+          echo "tarball=$tarball" >> "$GITHUB_OUTPUT"
+
+      - name: Publish to npm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          set -euo pipefail
+          pkg="$(node -p "require('./package.json').name")"
+          ver="$(node -p "require('./package.json').version")"
+          case "$ver" in
+            *-*) dist_tag=preview ;;
+            *) dist_tag=latest ;;
+          esac
+          if npm view "$pkg@$ver" version >/dev/null 2>&1; then
+            echo "$pkg@$ver is already on npm; skipping publish"
+          elif [ -n "${NPM_TOKEN:-}" ]; then
+            echo "publishing $pkg@$ver under dist-tag $dist_tag with a token (no provenance)"
+            npm publish "./pack-out/${{ steps.pack.outputs.tarball }}" --access public --tag "$dist_tag"
+          else
+            echo "publishing $pkg@$ver under dist-tag $dist_tag with provenance"
+            npm publish "./pack-out/${{ steps.pack.outputs.tarball }}" --access public --tag "$dist_tag" --provenance
+          fi
+
+      - name: GitHub Release
+        if: startsWith(github.ref, 'refs/tags/v')
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          ver="$(node -p "require('./package.json').version")"
+          case "$ver" in
+            *-*) prerelease=--prerelease ;;
+            *) prerelease= ;;
+          esac
+          gh release create "$GITHUB_REF_NAME" "./pack-out/${{ steps.pack.outputs.tarball }}" \
+            --title "$GITHUB_REF_NAME" \
+            --notes-file CHANGELOG.md \
+            $prerelease
