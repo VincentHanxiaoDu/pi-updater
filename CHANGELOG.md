@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.6.0-preview.0 - unreleased
+
+Preview build for hands-on testing before a stable release.
+
+- Every answered prompt settles, including Skip on the pi-only prompt, so a
+  decision is never re-asked in the same session.
+- Extension update decisions are machine-level: answering on one machine does
+  not silence the prompt on another.
+- A version the user acted on no longer re-prompts.
+- A stale `ctx` is survived rather than taking the host daemon down with it.
+- Hosts with no terminal install the update themselves; hosts that cannot run
+  it are not offered the action.
+- Verified against `@earendil-works/pi-coding-agent` 0.85.0 (the version PI WEB
+  builds against): typecheck clean and all tests pass.
+
 ## 0.4.1 - 2026-07-05
 
 - Combined prompt: group update actions together, Skip last.
